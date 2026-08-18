@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+config.json
+
+maps/**/*.png
+maps/**/*.webp
+maps/**/*.jpg
+!maps/gateway_current/map.webp
+
+# Generated application icons.
+assets/*.png
+assets/*.ico
+
