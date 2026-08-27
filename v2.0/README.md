@@ -6,7 +6,7 @@ clipboard hoặc IslePilot REST.
 
 ## Tải xuống
 
-Tải `The-Maps.exe` (bản v2.0) mới nhất tại [GitHub Releases](https://github.com/EmpireOcean/The-Maps/releases/latest).
+Tải `The-Maps-v2.0.exe` tại [GitHub Releases](https://github.com/EmpireOcean/The-Maps/releases/latest).
 Không cần cài Python hoặc tải mã nguồn.
 
 ## Cách sử dụng (chế độ mặc định)

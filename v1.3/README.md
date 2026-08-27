@@ -5,7 +5,7 @@ hợp lệ từ clipboard — hoặc theo thời gian thực nếu bạn kết n
 
 ## Tải xuống
 
-Tải `The-Maps.exe` mới nhất tại [GitHub Releases](https://github.com/EmpireOcean/The-Maps/releases/latest).
+Tải `The-Maps-v1.3.exe` tại [GitHub Releases](https://github.com/EmpireOcean/The-Maps/releases/latest).
 Không cần cài Python hoặc tải mã nguồn.
 
 ## Cách sử dụng (chế độ mặc định)
