@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+config.json
+
+v1.3/maps/**/*.png
+v1.3/maps/**/*.webp
+v1.3/maps/**/*.jpg
+!v1.3/maps/gateway_current/map.webp
+
+v2.0/maps/**/*.png
+v2.0/maps/**/*.webp
+v2.0/maps/**/*.jpg
+!v2.0/maps/gateway_current/map.webp
+
+# Generated application icons.
+v1.3/assets/*.png
+v1.3/assets/*.ico
+v2.0/assets/*.png
+v2.0/assets/*.ico
