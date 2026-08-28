@@ -15,6 +15,7 @@ from tkinter import messagebox, ttk
 from ctypes import wintypes
 
 import pystray
+import requests
 from PIL import Image, ImageTk
 
 import islepilot
@@ -33,6 +34,13 @@ APP_ICON_PNG = RESOURCE_ROOT / "assets" / "the_maps.png"
 YOUTUBE_URL = "https://www.youtube.com/@GlobalDailyHighlights"
 DISCORD_URL = "https://discord.gg/XpkRPpDhPU"
 APP_VERSION = "1.3.0"
+
+# v1.3 and v2.0 ship together in one combined GitHub Release — bump this
+# whenever a new combined release is cut so the update check below fires.
+RELEASE_TAG = "v2"
+GITHUB_RELEASE_API = "https://api.github.com/repos/EmpireOcean/The-Maps/releases/latest"
+GITHUB_RELEASE_PAGE = "https://github.com/EmpireOcean/The-Maps/releases/latest"
+UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 VK_TAB = 0x09
 MIN_ZOOM = 1.0
@@ -448,6 +456,8 @@ class MapApp:
         if saved_credentials:
             self._islepilot_start_session(*saved_credentials)
         self._poll_hud_visibility()
+        self._update_notified = False
+        self.root.after(5000, self._check_for_update)
 
     def _initial_profile(self) -> MapProfile:
         selected = ""
@@ -803,6 +813,33 @@ class MapApp:
             else:
                 self._hud.hide()
         self.root.after(FOREGROUND_POLL_MS, self._poll_hud_visibility)
+
+    def _check_for_update(self) -> None:
+        threading.Thread(target=self._check_for_update_worker, daemon=True).start()
+        self.root.after(UPDATE_CHECK_INTERVAL_MS, self._check_for_update)
+
+    def _check_for_update_worker(self) -> None:
+        try:
+            response = requests.get(
+                GITHUB_RELEASE_API, timeout=8.0,
+                headers={"Accept": "application/vnd.github+json"},
+            )
+            response.raise_for_status()
+            latest_tag = response.json().get("tag_name")
+        except (requests.RequestException, ValueError, OSError):
+            return
+        if latest_tag and latest_tag != RELEASE_TAG:
+            self.root.after(0, lambda: self._notify_update_available(latest_tag))
+
+    def _notify_update_available(self, latest_tag: str) -> None:
+        if self._update_notified:
+            return
+        self._update_notified = True
+        if messagebox.askyesno(
+            "The-Maps",
+            f"Đã có bản cập nhật mới trên GitHub ({latest_tag}). Mở trang tải về?",
+        ):
+            webbrowser.open(GITHUB_RELEASE_PAGE)
 
     def _load_map_image(self) -> None:
         self._cancel_hq_job()

@@ -11,12 +11,13 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import messagebox, ttk
 from ctypes import wintypes
 
 import pystray
+import requests
 from PIL import Image, ImageTk
 
 import islepilot
@@ -37,11 +38,27 @@ YOUTUBE_URL = "https://www.youtube.com/@GlobalDailyHighlights"
 DISCORD_URL = "https://discord.gg/XpkRPpDhPU"
 APP_VERSION = "2.0"
 
+# v1.3 and v2.0 ship together in one combined GitHub Release — bump this
+# whenever a new combined release is cut so the update check below fires.
+RELEASE_TAG = "v2"
+GITHUB_RELEASE_API = "https://api.github.com/repos/EmpireOcean/The-Maps/releases/latest"
+GITHUB_RELEASE_PAGE = "https://github.com/EmpireOcean/The-Maps/releases/latest"
+UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
+
 VK_TAB = 0x09
 MIN_ZOOM = 1.0
 MAX_ZOOM = 6.0
 ZOOM_STEP = 1.15
 HQ_REDRAW_DELAY_MS = 120
+
+# Zone overlays are pre-rendered PNGs (hand-traced by the user directly over
+# the Gateway basemap, same pixel dimensions as map.webp) composited straight
+# onto the map image at render time — pixel-accurate, no vectorization.
+# (data key, chip label, image filename in the profile's map folder, chip color)
+ZONE_LAYERS: tuple[tuple[str, str, str, str], ...] = (
+    ("migrations", "Migration", "zone_migration.png", "#ff9800"),
+    ("patrol_zones", "Patrol", "zone_patrol.png", "#ab47bc"),
+)
 
 
 @dataclass(frozen=True)
@@ -64,6 +81,7 @@ class MapProfile:
     invert_x: bool = False
     invert_y: bool = False
     heading_offset_deg: float = 0.0
+    zone_image_paths: dict[str, Path] = field(default_factory=dict)
 
     def to_normalized(self, position: Position) -> tuple[float, float]:
         if self.swap_axes:
@@ -128,6 +146,11 @@ def load_profiles() -> list[MapProfile]:
             data = json.loads(manifest.read_text(encoding="utf-8"))
             bounds = data["world_bounds"]
             image = manifest.parent / data["image"] if data.get("image") else None
+            zone_image_paths = {}
+            for key, _label, filename, _color in ZONE_LAYERS:
+                zone_file = manifest.parent / filename
+                if zone_file.exists():
+                    zone_image_paths[key] = zone_file
             profiles.append(
                 MapProfile(
                     profile_id=data["id"],
@@ -141,6 +164,7 @@ def load_profiles() -> list[MapProfile]:
                     invert_x=bool(data.get("invert_x", False)),
                     invert_y=bool(data.get("invert_y", False)),
                     heading_offset_deg=float(data.get("heading_offset_deg", 0.0)),
+                    zone_image_paths=zone_image_paths,
                 )
             )
         except (KeyError, ValueError, TypeError, json.JSONDecodeError):
@@ -262,7 +286,10 @@ class MiniMapPanel:
     def hide(self) -> None:
         self.window.withdraw()
 
-    def update_map(self, source_image, profile: MapProfile, x: float, y: float, heading_deg: float) -> None:
+    def update_map(
+        self, source_image, profile: MapProfile, x: float, y: float, heading_deg: float,
+        zone_images: tuple["Image.Image", ...] = (),
+    ) -> None:
         self.canvas.delete("all")
         if source_image is None:
             return
@@ -275,8 +302,11 @@ class MiniMapPanel:
             int(left * width), int(top * height),
             int((left + frac) * width), int((top + frac) * height),
         )
-        cropped = source_image.crop(crop_box).resize((MINI_MAP_SIZE, MINI_MAP_SIZE), Image.Resampling.LANCZOS)
-        self._photo = ImageTk.PhotoImage(cropped)
+        cropped = source_image.crop(crop_box).convert("RGBA")
+        for zone_image in zone_images:
+            cropped.alpha_composite(zone_image.crop(crop_box))
+        resized = cropped.resize((MINI_MAP_SIZE, MINI_MAP_SIZE), Image.Resampling.LANCZOS)
+        self._photo = ImageTk.PhotoImage(resized)
         self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
         # Normally the player is centered. Near the source-image edges the
         # crop is clamped, so compute the marker's true position inside the
@@ -383,8 +413,11 @@ class IslePilotHud:
         self.minimap.hide()
         self.quests.hide()
 
-    def update_map(self, source_image, profile: MapProfile, x: float, y: float, heading_deg: float) -> None:
-        self.minimap.update_map(source_image, profile, x, y, heading_deg)
+    def update_map(
+        self, source_image, profile: MapProfile, x: float, y: float, heading_deg: float,
+        zone_images: tuple["Image.Image", ...] = (),
+    ) -> None:
+        self.minimap.update_map(source_image, profile, x, y, heading_deg, zone_images=zone_images)
 
     def update_vitals(self, status: "islepilot.IslePilotStatus") -> None:
         self.minimap.update_vitals(status)
@@ -431,6 +464,10 @@ class MapApp:
         self._pan_last: tuple[int, int] | None = None
         self._pending_hq_job: str | None = None
 
+        self._zone_images: dict[str, Image.Image] = {}
+        self._zone_visible: dict[str, bool] = {key: True for key, _label, _filename, _color in ZONE_LAYERS}
+        self._zone_toggle_hitboxes: dict[str, tuple[float, float, float, float]] = {}
+
         self._islepilot_cred_path = DATA_ROOT / "islepilot.cred"
         self._islepilot_session: islepilot.IslePilotSession | None = None
         self._islepilot_steam_id: str | None = None
@@ -471,6 +508,8 @@ class MapApp:
         if saved_credentials:
             self._islepilot_start_session(*saved_credentials)
         self._poll_hud_visibility()
+        self._update_notified = False
+        self.root.after(5000, self._check_for_update)
 
     def _initial_profile(self) -> MapProfile:
         selected = ""
@@ -922,6 +961,7 @@ class MapApp:
             position.x,
             position.y,
             self._local_heading_deg,
+            zone_images=self._active_zone_images(),
         )
 
         if self.root.state() == "normal":
@@ -1046,6 +1086,7 @@ class MapApp:
                 draw_position.x,
                 draw_position.y,
                 heading,
+                zone_images=self._active_zone_images(),
             )
 
     def _poll_hud_visibility(self) -> None:
@@ -1057,6 +1098,33 @@ class MapApp:
             else:
                 self._hud.hide()
         self.root.after(FOREGROUND_POLL_MS, self._poll_hud_visibility)
+
+    def _check_for_update(self) -> None:
+        threading.Thread(target=self._check_for_update_worker, daemon=True).start()
+        self.root.after(UPDATE_CHECK_INTERVAL_MS, self._check_for_update)
+
+    def _check_for_update_worker(self) -> None:
+        try:
+            response = requests.get(
+                GITHUB_RELEASE_API, timeout=8.0,
+                headers={"Accept": "application/vnd.github+json"},
+            )
+            response.raise_for_status()
+            latest_tag = response.json().get("tag_name")
+        except (requests.RequestException, ValueError, OSError):
+            return
+        if latest_tag and latest_tag != RELEASE_TAG:
+            self.root.after(0, lambda: self._notify_update_available(latest_tag))
+
+    def _notify_update_available(self, latest_tag: str) -> None:
+        if self._update_notified:
+            return
+        self._update_notified = True
+        if messagebox.askyesno(
+            "The-Maps",
+            f"Đã có bản cập nhật mới trên GitHub ({latest_tag}). Mở trang tải về?",
+        ):
+            webbrowser.open(GITHUB_RELEASE_PAGE)
 
     def _load_map_image(self) -> None:
         self._cancel_hq_job()
@@ -1071,6 +1139,12 @@ class MapApp:
                 self.source_image = Image.open(self.profile.image_path).convert("RGB")
             except (OSError, ValueError):
                 self.source_image = None
+        self._zone_images = {}
+        for key, path in self.profile.zone_image_paths.items():
+            try:
+                self._zone_images[key] = Image.open(path).convert("RGBA")
+            except (OSError, ValueError):
+                pass
         self._size_map_window()
 
     def _poll_clipboard(self) -> None:
@@ -1128,9 +1202,15 @@ class MapApp:
             crop_bottom = min(source_height, max(crop_top + 1, round((view_top + view_h) * source_height)))
             crop_box = (crop_left, crop_top, crop_right, crop_bottom)
             resample_filter = resample if resample is not None else Image.Resampling.LANCZOS
-            cache_key = (crop_box, (width, height), resample_filter)
+            active_zone_keys = tuple(
+                key for key, _label, _filename, _color in ZONE_LAYERS
+                if self._zone_visible.get(key) and key in self._zone_images
+            )
+            cache_key = (crop_box, (width, height), resample_filter, active_zone_keys)
             if self.rendered_size != cache_key:
-                cropped = self.source_image.crop(crop_box)
+                cropped = self.source_image.crop(crop_box).convert("RGBA")
+                for key in active_zone_keys:
+                    cropped.alpha_composite(self._zone_images[key].crop(crop_box))
                 resized = cropped.resize((width, height), resample_filter)
                 self.map_image = ImageTk.PhotoImage(resized)
                 self.rendered_size = cache_key
@@ -1158,6 +1238,7 @@ class MapApp:
             )
 
         self._canvas_w, self._canvas_h = width, height
+        self._draw_zone_toggles()
         self._draw_history_path()
         if self.older:
             self._draw_marker(self.older, 5, "#71838b")
@@ -1173,6 +1254,9 @@ class MapApp:
 
     def _pixel(self, position: Position) -> tuple[float, float]:
         nx, ny = self.profile.to_normalized(position)
+        return self._normalized_to_pixel(nx, ny)
+
+    def _normalized_to_pixel(self, nx: float, ny: float) -> tuple[float, float]:
         if self._view is not None:
             view_left, view_top, view_w, view_h = self._view
             x = (nx - view_left) / view_w * self._canvas_w
@@ -1180,6 +1264,41 @@ class MapApp:
             return x, y
         left, top, width, height = self._placeholder_rect
         return left + nx * width, top + ny * height
+
+    def _active_zone_images(self) -> tuple["Image.Image", ...]:
+        return tuple(
+            self._zone_images[key]
+            for key, _label, _filename, _color in ZONE_LAYERS
+            if self._zone_visible.get(key) and key in self._zone_images
+        )
+
+    def _draw_zone_toggles(self) -> None:
+        self._zone_toggle_hitboxes = {}
+        if not self._zone_images:
+            return
+        margin = 12
+        chip_h = 26
+        x = margin
+        y = self._canvas_h - margin - chip_h
+        for key, label, _filename, color in ZONE_LAYERS:
+            if key not in self._zone_images:
+                continue
+            active = self._zone_visible.get(key, False)
+            text = f"{'✓' if active else '○'} {label}"
+            text_id = self.canvas.create_text(
+                x + 10, y + chip_h / 2, text=text,
+                fill="#10191d" if active else "#cfd8dc",
+                font=("Segoe UI", 9, "bold"), anchor="w",
+            )
+            bbox = self.canvas.bbox(text_id)
+            chip_w = (bbox[2] - bbox[0]) + 20 if bbox else 90
+            rect_id = self.canvas.create_rectangle(
+                x, y, x + chip_w, y + chip_h,
+                fill=color if active else "#1b262c", outline=color, width=1.5,
+            )
+            self.canvas.tag_lower(rect_id, text_id)
+            self._zone_toggle_hitboxes[key] = (x, y, x + chip_w, y + chip_h)
+            x += chip_w + 8
 
     def _draw_marker(self, position, radius, color):
         x, y = self._pixel(position)
@@ -1254,6 +1373,11 @@ class MapApp:
         self._schedule_hq_redraw()
 
     def _on_pan_start(self, event) -> None:
+        for key, (x1, y1, x2, y2) in self._zone_toggle_hitboxes.items():
+            if x1 <= event.x <= x2 and y1 <= event.y <= y2:
+                self._zone_visible[key] = not self._zone_visible[key]
+                self._redraw()
+                return
         if not self.source_image:
             return
         self._pan_last = (event.x, event.y)

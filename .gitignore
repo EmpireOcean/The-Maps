@@ -13,6 +13,8 @@ v2.0/maps/**/*.png
 v2.0/maps/**/*.webp
 v2.0/maps/**/*.jpg
 !v2.0/maps/gateway_current/map.webp
+!v2.0/maps/gateway_current/zone_migration.png
+!v2.0/maps/gateway_current/zone_patrol.png
 
 # Generated application icons.
 v1.3/assets/*.png
