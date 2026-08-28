@@ -19,7 +19,6 @@ from urllib.parse import urljoin, urlparse
 
 import psutil
 import requests
-from scapy.all import AsyncSniffer, UDP
 
 PROCESS_NAME = "TheIsleClient-Win64-Shipping.exe"
 NPCAP_REBOOT_REQUIRED_EXIT_CODE = 3010  # ERROR_SUCCESS_REBOOT_REQUIRED
@@ -844,6 +843,25 @@ class _MovementTracker:
             self._hypotheses.pop(layout, None)
 
 
+_scapy_async_sniffer = None
+_scapy_udp = None
+
+
+def _load_scapy():
+    """Import scapy lazily, on first capture attempt rather than at module
+    load. Right after a fresh Npcap install, scapy's import-time driver
+    probing can throw if the driver isn't fully ready yet (sometimes a real
+    Windows restart is needed even when the installer claims success) — if
+    that happened at the top of this module, it would crash the whole app
+    before _run()'s try/except ever gets a chance to catch it."""
+    global _scapy_async_sniffer, _scapy_udp
+    if _scapy_async_sniffer is None:
+        from scapy.all import AsyncSniffer, UDP
+        _scapy_async_sniffer = AsyncSniffer
+        _scapy_udp = UDP
+    return _scapy_async_sniffer, _scapy_udp
+
+
 class LocalMovementSession:
     """Npcap-backed local X/Y/Z/Yaw stream for The Isle.
 
@@ -903,7 +921,8 @@ class LocalMovementSession:
             return
 
         try:
-            self._sniffer = AsyncSniffer(
+            async_sniffer, _udp = _load_scapy()
+            self._sniffer = async_sniffer(
                 filter="udp",
                 prn=self._handle_packet,
                 store=False,
@@ -954,9 +973,10 @@ class LocalMovementSession:
 
     def _handle_packet(self, packet) -> None:
         try:
-            if UDP not in packet:
+            _async_sniffer, udp_layer = _load_scapy()
+            if udp_layer not in packet:
                 return
-            udp = packet[UDP]
+            udp = packet[udp_layer]
 
             with self._ports_lock:
                 ports = self._ports

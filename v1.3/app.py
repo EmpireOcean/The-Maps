@@ -37,7 +37,7 @@ APP_VERSION = "1.3.0"
 
 # v1.3 and v2.0 ship together in one combined GitHub Release — bump this
 # whenever a new combined release is cut so the update check below fires.
-RELEASE_TAG = "v2"
+RELEASE_TAG = "v3"
 GITHUB_RELEASE_API = "https://api.github.com/repos/EmpireOcean/The-Maps/releases/latest"
 GITHUB_RELEASE_PAGE = "https://github.com/EmpireOcean/The-Maps/releases/latest"
 UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000

@@ -4,11 +4,11 @@ import json
 import math
 import os
 import re
-import subprocess
 import sys
 import ctypes
 import threading
 import time
+import traceback
 import tkinter as tk
 import webbrowser
 from dataclasses import dataclass, field
@@ -40,7 +40,7 @@ APP_VERSION = "2.0"
 
 # v1.3 and v2.0 ship together in one combined GitHub Release — bump this
 # whenever a new combined release is cut so the update check below fires.
-RELEASE_TAG = "v2"
+RELEASE_TAG = "v3"
 GITHUB_RELEASE_API = "https://api.github.com/repos/EmpireOcean/The-Maps/releases/latest"
 GITHUB_RELEASE_PAGE = "https://github.com/EmpireOcean/The-Maps/releases/latest"
 UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
@@ -826,21 +826,6 @@ class MapApp:
         ):
             self._install_npcap_async()
 
-    def _restart_app(self) -> None:
-        if getattr(sys, "frozen", False):
-            command = [sys.executable, *sys.argv[1:]]
-        else:
-            command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
-        try:
-            subprocess.Popen(command)
-        except OSError:
-            messagebox.showwarning(
-                "The-Maps",
-                "Npcap đã được cài. Hãy đóng và mở lại The-Maps để bật realtime.",
-            )
-            return
-        self._exit()
-
     def _install_npcap_async(self) -> None:
         if localtelemetry.npcap_installed():
             messagebox.showinfo("The-Maps", "Npcap đã được cài trên máy.")
@@ -904,12 +889,8 @@ class MapApp:
                         "bật minimap realtime.",
                     )
                 elif success:
-                    messagebox.showinfo(
-                        "The-Maps",
-                        f"{message}\n\n"
-                        "The-Maps sẽ khởi động lại để bật minimap realtime.",
-                    )
-                    self._restart_app()
+                    messagebox.showinfo("The-Maps", message)
+                    self._retry_local_telemetry()
                 else:
                     messagebox.showerror(
                         "The-Maps · Npcap",
@@ -1422,6 +1403,20 @@ def main() -> None:
         MapApp(root)
     except RuntimeError as exc:
         messagebox.showerror("The-Maps", str(exc))
+        root.destroy()
+        return
+    except Exception:
+        crash_log = DATA_ROOT / "crash.log"
+        try:
+            DATA_ROOT.mkdir(parents=True, exist_ok=True)
+            crash_log.write_text(traceback.format_exc(), encoding="utf-8")
+        except OSError:
+            pass
+        messagebox.showerror(
+            "The-Maps",
+            "The-Maps gặp lỗi khi khởi động và không mở được.\n\n"
+            f"Chi tiết lỗi đã được ghi vào:\n{crash_log}",
+        )
         root.destroy()
         return
     root.mainloop()
