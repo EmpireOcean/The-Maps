@@ -43,7 +43,7 @@ APP_VERSION = "2.1"
 # "latest" tag (not a version-ordering check), so a local build whose tag
 # doesn't match yet — ahead or behind — always trips the "update available"
 # prompt.
-RELEASE_TAG = "v4"
+RELEASE_TAG = "v5"
 GITHUB_RELEASE_API = "https://api.github.com/repos/EmpireOcean/The-Maps/releases/latest"
 GITHUB_RELEASE_PAGE = "https://github.com/EmpireOcean/The-Maps/releases/latest"
 UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
@@ -338,6 +338,53 @@ def _get_cursor_state() -> tuple[bool, int, int] | None:
     if not ctypes.windll.user32.GetCursorInfo(ctypes.byref(info)):
         return None
     return (bool(info.flags & _CURSOR_SHOWING), info.ptScreenPos.x, info.ptScreenPos.y)
+
+
+_TIMER_RESOLUTION_MS = 1
+
+
+def _raise_timer_resolution() -> None:
+    """Ask Windows for ~1ms timer/wait granularity for this process, instead
+    of the usual default of ~15.6ms (1000/64).
+
+    _poll_fake_cursor asks Tk's root.after() to fire every FAKE_CURSOR_
+    TRACK_MS — but that request is only ever as accurate as the underlying
+    OS wait primitive Tcl uses under the hood, which by default quantizes to
+    the system timer tick (~15.6ms). Requesting an 8ms (or 4ms) callback
+    without this call doesn't make it fire at 8ms/4ms — it silently rounds
+    up to the next ~15.6ms tick, and jitters between 1x and 2x that as the
+    scheduler's phase drifts. That's a plausible, well-documented cause of
+    the fake cursor visibly stepping/stalling during fast, continuous
+    movement (e.g. a fast circle) even though nothing in this app itself is
+    slow: the *timer* granularity is the bottleneck, not the work being
+    done in each tick.
+
+    One important caveat found while looking into this: on Windows 11, a
+    process's own timeBeginPeriod request can be reverted by the OS while
+    that process is occluded/minimized/invisible (this was tightened up in
+    Windows 10 2004+, which also made the effect per-process rather than
+    system-wide — see the "Great Rule Change" writeup by Bruce Dawson).
+    The-Maps' HUD windows are always genuinely on-screen and composited
+    (just click-through and non-activating, never literally hidden or
+    covered), so this shouldn't trigger that reversion in practice, but
+    it's worth knowing about if the effect ever seems to stop helping after
+    the window has been alt-tabbed around for a while.
+
+    Trade-off: this measurably increases how often the CPU wakes from idle
+    for the whole process's lifetime, which costs a little extra power —
+    acceptable here since this only runs while actively playing a game,
+    which is already keeping the GPU/CPU busy."""
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(_TIMER_RESOLUTION_MS)
+    except OSError:
+        pass
+
+
+def _restore_timer_resolution() -> None:
+    try:
+        ctypes.windll.winmm.timeEndPeriod(_TIMER_RESOLUTION_MS)
+    except OSError:
+        pass
 
 
 def _load_config() -> dict:
@@ -1020,8 +1067,18 @@ class IslePilotHud:
 
 
 FOREGROUND_POLL_MS = 300
-FAKE_CURSOR_TRACK_MS = 8  # ~120 Hz position follow, decoupled from the visibility decision below
-FAKE_CURSOR_DECISION_MS = 33  # show/hide latch check — cheap (one GetCursorInfo call), doesn't need 120 Hz
+# One combined GetCursorInfo call drives both the show/hide decision and
+# position tracking every tick — see _poll_fake_cursor. Requesting this
+# interval only actually gets honored at this granularity because main()
+# calls _raise_timer_resolution() — without it, Tk's root.after() quantizes
+# to Windows' default ~15.6ms timer tick regardless of what's requested
+# here, which is what was making fast circular movement look like it
+# stepped/stalled every so often even though nothing was "slow". 4ms
+# (250 Hz) comfortably covers even a 240Hz gaming monitor's refresh rate
+# with the now-real ~1ms timer granularity backing it; going faster than
+# that has no visible benefit (nothing refreshes the screen that often) and
+# just spends more CPU time on GetCursorInfo/SetWindowPos calls for nothing.
+FAKE_CURSOR_TRACK_MS = 4
 FAKE_CURSOR_REAL_VISIBLE_DEBOUNCE_SECONDS = 0.2  # a single transient GetCursorInfo sample must not hide the fake cursor
 LOCAL_POSITION_FRESH_SECONDS = 2.0
 # Npcap publishes at ~8-10 Hz — shifting older/previous on every sample would
@@ -1029,6 +1086,21 @@ LOCAL_POSITION_FRESH_SECONDS = 2.0
 # marker. Only advance the trail this often instead, so it reads the same as
 # the clipboard-driven trail (spaced-out waypoints, not a solid smear).
 LOCAL_TRAIL_MIN_INTERVAL_SECONDS = 1.5
+# _apply_local_movement used to re-render the minimap (crop + alpha_composite
+# + LANCZOS resize + a fresh ImageTk.PhotoImage) on every single local sample
+# — up to 20 Hz (see _MIN_PUBLISH_INTERVAL in localtelemetry.py). All of that
+# runs on the Tk main thread and holds the GIL for most of it (PIL's resize/
+# composite plus the PhotoImage->Tcl marshal), which is the same thread and
+# the same GIL that _poll_fake_cursor needs every 8ms to keep the
+# fake cursor glued to the real mouse position. Under real movement the two
+# were fighting for the CPU/GIL: the cursor would freeze while a burst of
+# minimap re-renders ran back-to-back, then snap to the mouse's latest
+# position once the backlog cleared — reported as the fake cursor "stutters
+# then jumps" when the mouse is moved quickly. Rendering the minimap this
+# often is unnecessary anyway (it's a 220x220 image); capping it well below
+# the cursor-tracking rate keeps the main thread free often enough for the
+# cursor poll to stay smooth without any visible loss of minimap fluidity.
+MINIMAP_RENDER_MIN_INTERVAL_SECONDS = 0.075
 
 
 class MapApp:
@@ -1083,6 +1155,7 @@ class MapApp:
         self._local_last_update = 0.0
         self._local_heading_deg: float | None = None
         self._local_trail_last_update = 0.0
+        self._local_minimap_render_last_update = 0.0
         self._npcap_prompted = False
 
         root.title("The-Maps")
@@ -1107,8 +1180,7 @@ class MapApp:
         if saved_credentials:
             self._islepilot_start_session(*saved_credentials)
         self._poll_hud_visibility()
-        self._poll_fake_cursor_position()
-        self._poll_fake_cursor_visibility()
+        self._poll_fake_cursor()
         self._update_notified = False
         self.root.after(5000, self._check_for_update)
 
@@ -1156,7 +1228,64 @@ class MapApp:
         self.root.after(0, self._open_settings)
 
     def _tray_exit(self, _icon=None, _item=None) -> None:
+        # Belt-and-suspenders: _exit() below is meant to be unmissable, but
+        # it's scheduled via root.after(0, ...) onto the Tk mainloop — if
+        # that loop is itself wedged (e.g. stuck inside a modal messagebox()
+        # call that ended up rendered behind The Isle's fullscreen/topmost
+        # window — see _show_message — so nobody could see it to click OK),
+        # the scheduled callback never runs and Exit silently does nothing.
+        # This watchdog force-terminates the process a few seconds later no
+        # matter what, so "Exit The-Maps" always actually exits.
+        threading.Thread(target=self._force_exit_watchdog, daemon=True).start()
         self.root.after(0, self._exit)
+
+    @staticmethod
+    def _force_exit_watchdog() -> None:
+        time.sleep(3.0)
+        os._exit(1)
+
+    def _show_message(
+        self, kind: str, title: str, message: str,
+    ) -> bool | None:
+        """Show a messagebox dialog that is guaranteed to appear in front of
+        The Isle, and never leave the app stuck.
+
+        tkinter.messagebox dialogs are NOT topmost by default. Since The-Maps'
+        whole job is to sit on top of a fullscreen, topmost game window, a
+        plain messagebox call here can render *behind* the game — completely
+        invisible to the player — while still blocking Tk's event loop until
+        someone clicks it. In practice that froze the entire app (HUD stopped
+        updating, hotkeys stopped responding, and even "Exit The-Maps" from
+        the tray stopped working, since Exit just schedules a callback that
+        can't run until the invisible modal dialog is dismissed) until the
+        process was killed from Task Manager — reported as "it crashes and
+        I can't close it" after playing for a while (long enough for the
+        IslePilot session-expired warning or the once-a-day update check to
+        fire on their own, unprompted, while the game had focus).
+
+        Anchoring the dialog to a throwaway topmost Toplevel keeps it above
+        the game so it's always visible and dismissible.
+        """
+        anchor = tk.Toplevel(self.root)
+        anchor.overrideredirect(True)
+        anchor.attributes("-topmost", True)
+        anchor.geometry("1x1+0+0")
+        try:
+            anchor.deiconify()
+            anchor.lift()
+            anchor.focus_force()
+            func = {
+                "info": messagebox.showinfo,
+                "warning": messagebox.showwarning,
+                "error": messagebox.showerror,
+                "askyesno": messagebox.askyesno,
+            }[kind]
+            return func(title, message, parent=anchor)
+        finally:
+            try:
+                anchor.destroy()
+            except tk.TclError:
+                pass
 
     def _exit(self) -> None:
         # Best-effort cleanup only — pystray's tray_icon.stop() has been seen
@@ -1165,13 +1294,38 @@ class MapApp:
         # throwaway daemon thread instead of waiting on it, and hard-exit
         # the process afterward so a stuck background thread (tray icon,
         # sniffer, IslePilot poll) can never prevent The-Maps from closing.
-        if self.tray_icon:
-            threading.Thread(target=self.tray_icon.stop, daemon=True).start()
-        self._islepilot_stop_session()
-        self._stop_local_telemetry()
+        #
+        # Every step below is now individually guarded: an unhandled
+        # exception raised directly inside a Tk after()-scheduled callback
+        # like this one is silently swallowed by Tk's default callback
+        # exception handler — it does NOT propagate, crash the app, or stop
+        # the mainloop, it just aborts *this* callback partway through. That
+        # meant a failure in any single cleanup step here could leave
+        # os._exit(0) never reached, and the process quietly stuck running
+        # in the background with a hidden window — indistinguishable from a
+        # hang/crash to the user. Wrapping each step means one failing step
+        # can never prevent the next one (or the final hard exit) from
+        # running.
+        try:
+            if self.tray_icon:
+                threading.Thread(target=self.tray_icon.stop, daemon=True).start()
+        except Exception:
+            pass
+        try:
+            self._islepilot_stop_session()
+        except Exception:
+            pass
+        try:
+            self._stop_local_telemetry()
+        except Exception:
+            pass
         try:
             self.root.destroy()
-        except tk.TclError:
+        except Exception:
+            pass
+        try:
+            _restore_timer_resolution()
+        except Exception:
             pass
         os._exit(0)
 
@@ -1270,22 +1424,28 @@ class MapApp:
             self._hud.minimap.zoom_by_delta(delta)
 
     def _mouse_hook_loop(self) -> None:
-        """Low-level mouse hook, mirroring _keyboard_hook_loop. Does two
-        unrelated things with the same hook, since only one global mouse
-        hook should exist at all:
+        """Low-level mouse hook, mirroring _keyboard_hook_loop.
 
-        1. Records every event's screen position into self._last_mouse_pos
-           — a plain tuple write, safe to read from the main thread without
-           a lock (GIL makes the assignment atomic). This is the fake
-           cursor's position source instead of polling GetCursorInfo, which
-           only updates at whatever rate _poll_fake_cursor_position runs —
-           this hook sees every real mouse-move event as it happens.
+        Records every event's screen position into self._last_mouse_pos — a
+        plain tuple write, safe to read from the main thread without a lock
+        (GIL makes the assignment atomic) — kept only as incidental/debug
+        state now. It used to double as the fake cursor's position source,
+        on the theory that this hook sees every real mouse-move event as it
+        happens, cheaper than polling GetCursorInfo. That backfired: a
+        low-level hook's callback needs the GIL to run even a single tuple
+        assignment, and Windows silently (and permanently — no notification)
+        removes a low-level hook whose callback doesn't return within
+        LowLevelHooksTimeout, which main-thread GIL contention could trip
+        under load. See _poll_fake_cursor for the fix (poll
+        GetCursorInfo directly instead, same as the shipped gw2-cursor tool
+        does for this exact kind of overlay).
 
-        2. The minimap body window is click-through (see
-           _make_click_through) so it never receives WM_MOUSEWHEEL itself —
-           this watches for wheel events over the minimap's last-known
-           screen rect instead, applies the zoom on the main thread, and
-           swallows the event so it doesn't also reach the game underneath.
+        The one thing this hook is still actually relied on for: the minimap
+        body window is click-through (see _make_click_through) so it never
+        receives WM_MOUSEWHEEL itself — this watches for wheel events over
+        the minimap's last-known screen rect instead, applies the zoom on
+        the main thread, and swallows the event so it doesn't also reach
+        the game underneath.
 
         Must never call into Tk from this thread beyond the existing
         root.after(0, ...) scheduling for the wheel case."""
@@ -1565,7 +1725,8 @@ class MapApp:
         if self._npcap_prompted or localtelemetry.npcap_installed():
             return
         self._npcap_prompted = True
-        if messagebox.askyesno(
+        if self._show_message(
+            "askyesno",
             "The-Maps · Realtime position",
             "Minimap realtime cần Npcap để đọc movement packets của The Isle.\n\n"
             "Npcap chưa được cài. The-Maps có thể tự tải installer trực tiếp "
@@ -1577,7 +1738,7 @@ class MapApp:
 
     def _install_npcap_async(self) -> None:
         if localtelemetry.npcap_installed():
-            messagebox.showinfo("The-Maps", "Npcap đã được cài trên máy.")
+            self._show_message("info", "The-Maps", "Npcap đã được cài trên máy.")
             self._retry_local_telemetry()
             return
 
@@ -1631,17 +1792,19 @@ class MapApp:
                     progress_window.destroy()
 
                 if success and reboot_required:
-                    messagebox.showinfo(
+                    self._show_message(
+                        "info",
                         "The-Maps",
                         f"{message}\n\n"
                         "Hãy khởi động lại Windows rồi mở The-Maps lại để "
                         "bật minimap realtime.",
                     )
                 elif success:
-                    messagebox.showinfo("The-Maps", message)
+                    self._show_message("info", "The-Maps", message)
                     self._retry_local_telemetry()
                 else:
-                    messagebox.showerror(
+                    self._show_message(
+                        "error",
                         "The-Maps · Npcap",
                         "Không cài được Npcap.\n\n"
                         f"{message}\n\n"
@@ -1683,16 +1846,24 @@ class MapApp:
         if self._hud is None:
             self._hud = IslePilotHud(self.root)
 
-        # The minimap is the hot path. Update it immediately from the local
-        # packet without waiting for the ~5s IslePilot snapshot.
-        self._hud.update_map(
-            self.source_image,
-            self.profile,
-            position.x,
-            position.y,
-            self._local_heading_deg,
-            zone_images=self._active_zone_images(),
-        )
+        # The minimap is the hot path, updated from the local packet without
+        # waiting for the ~5s IslePilot snapshot — but the actual PIL re-render
+        # (crop/composite/resize + a fresh PhotoImage) is throttled well below
+        # the sample rate; see MINIMAP_RENDER_MIN_INTERVAL_SECONDS above for
+        # why (it was starving the fake-cursor tracking loop of CPU/GIL time).
+        if (
+            self._local_last_update - self._local_minimap_render_last_update
+            >= MINIMAP_RENDER_MIN_INTERVAL_SECONDS
+        ):
+            self._local_minimap_render_last_update = self._local_last_update
+            self._hud.update_map(
+                self.source_image,
+                self.profile,
+                position.x,
+                position.y,
+                self._local_heading_deg,
+                zone_images=self._active_zone_images(),
+            )
 
         if self.root.state() == "normal":
             self._redraw()
@@ -1831,7 +2002,8 @@ class MapApp:
         was_connected = self._islepilot_connected()
         self._islepilot_disconnect()
         if was_connected:
-            messagebox.showwarning(
+            self._show_message(
+                "warning",
                 "The-Maps", "Phiên IslePilot đã hết hạn. Vào Settings để đăng nhập lại."
             )
 
@@ -1922,52 +2094,65 @@ class MapApp:
             self._fake_cursor.raise_above_hud()
         self.root.after(FOREGROUND_POLL_MS, self._poll_hud_visibility)
 
-    def _poll_fake_cursor_position(self) -> None:
-        """Fast, decision-free tracking loop: while the fake cursor is
-        latched active, follow the mouse hook's latest position via a raw
-        SetWindowPos (see _FakeCursor.move_to) — no GetCursorInfo, no
-        show/hide logic, nothing that could make this any heavier than one
-        Win32 call. Position and visibility are deliberately two separate
-        loops (see _poll_fake_cursor_visibility) so tightening one can
-        never slow down the other.
+    def _poll_fake_cursor(self) -> None:
+        """Single fast loop (FAKE_CURSOR_TRACK_MS) that both decides
+        show/hide *and* tracks position, from one GetCursorInfo call.
 
-        A dedicated thread driven by the mouse hook (woken via a
-        threading.Event, calling move_to() with a Win32 SetWindowPos on
-        the Tk-owned HWND from off the Tk thread) was tried instead of
-        this poll and made things worse in real testing — continuous
-        stutter, then the cursor vanishing outright after a while. Cross-
-        thread window manipulation on a window Tk itself owns isn't safe
-        here; reverted back to this main-thread poll until/unless the fake
-        cursor becomes its own independently-owned native window."""
-        if self._fake_cursor_active:
-            self._fake_cursor.move_to(*self._last_mouse_pos)
-        self.root.after(FAKE_CURSOR_TRACK_MS, self._poll_fake_cursor_position)
+        This used to be two separate loops: a "decision-free" position
+        tracker at ~120 Hz following self._last_mouse_pos (written by the
+        WH_MOUSE_LL hook's own thread), and a show/hide decision at a
+        slower ~30 Hz calling GetCursorInfo. That split caused two distinct,
+        reported symptoms once the hook-derived position was replaced with a
+        fresh GetCursorInfo query (see below) for tracking but the decision
+        loop was left at its slower rate with a multi-tick "stay outside the
+        HUD for N ticks" hide-debounce:
 
-    def _poll_fake_cursor_visibility(self) -> None:
-        """Latched/debounced show-hide decision — mirrors a
-        `shouldDrawHudCursor()` check, deliberately isolated from
-        _poll_fake_cursor_position so this is the one place to revisit if
-        the real-cursor-visible signal (GetCursorInfo, inherently a bit
-        noisy) ever needs tightening further.
+        - Entering the HUD quickly appeared to lag, because the show
+          decision could only fire on the next ~33 ms decision tick, not the
+          ~8 ms tracking tick.
+        - Leaving the HUD quickly showed the fake cursor sliding out past
+          the HUD's edge before it vanished, because the hide-debounce (added
+          to tolerate a *stale* hook position) kept it latched active for a
+          few more ticks after the fresh, accurate position had already left
+          the HUD rect — and the (already-fixed, now GetCursorInfo-driven)
+          position tracker kept faithfully moving it there in the meantime.
 
-        Once shown, stays shown until the mouse actually leaves every HUD
-        body region (checked every tick, no debounce — this exit is meant
-        to feel instant) or the real cursor is seen continuously visible
-        for FAKE_CURSOR_REAL_VISIBLE_DEBOUNCE_SECONDS (a transient single
-        sample must not hide it — that one-tick flip was the flicker)."""
-        x, y = self._last_mouse_pos
+        Merging both into one loop at the fast rate fixes both: the show/
+        hide decision now runs at the same ~120 Hz as tracking (no more lag
+        entering), and since GetCursorInfo is queried fresh every single
+        tick — never a stale hook value — there's no more staleness for a
+        hide-debounce to compensate for, so hiding goes back to being
+        immediate on the very next real "outside the HUD" sample (no more
+        overshoot leaving). The one debounce that's still legitimate and
+        kept is FAKE_CURSOR_REAL_VISIBLE_DEBOUNCE_SECONDS: that guards
+        against a single transient GetCursorInfo sample reporting the real
+        cursor visible while still inside the HUD, which is a different,
+        genuine sensor-noise case, not staleness.
+
+        gw2-cursor (github.com/fritzw/gw2-cursor), a shipped tool solving
+        this exact problem for a different game, does the same thing: no
+        hook for position — poll GetCursorPos-style state at a high fixed
+        rate (120 Hz in its case) and drive the overlay from that alone. The
+        low-level mouse hook here is kept only for its other job (detecting
+        wheel events over the minimap, which the click-through body never
+        receives), not for anything cursor-position-related."""
+        state = _get_cursor_state()
+        if state is None:
+            # Fail safe toward "stay out of the way" if the query fails.
+            self._set_fake_cursor_active(False)
+            self.root.after(FAKE_CURSOR_TRACK_MS, self._poll_fake_cursor)
+            return
+
+        real_showing, x, y = state
         mouse_in_hud = any(
             x1 <= x <= x2 and y1 <= y <= y2 for x1, y1, x2, y2 in self._hud_body_rects_cache
         )
         if not mouse_in_hud:
             self._set_fake_cursor_active(False)
         else:
-            state = _get_cursor_state()
-            # Fail safe toward "stay out of the way" if the query fails.
-            real_showing = True if state is None else state[0]
             if not self._fake_cursor_active:
                 if not real_showing:
-                    self._set_fake_cursor_active(True)
+                    self._set_fake_cursor_active(True, x, y)
             elif not real_showing:
                 self._real_cursor_visible_since = None
             else:
@@ -1976,15 +2161,31 @@ class MapApp:
                     self._real_cursor_visible_since = now
                 elif now - self._real_cursor_visible_since >= FAKE_CURSOR_REAL_VISIBLE_DEBOUNCE_SECONDS:
                     self._set_fake_cursor_active(False)
-        self.root.after(FAKE_CURSOR_DECISION_MS, self._poll_fake_cursor_visibility)
 
-    def _set_fake_cursor_active(self, active: bool) -> None:
+        if self._fake_cursor_active:
+            self._fake_cursor.move_to(x, y)
+
+        self.root.after(FAKE_CURSOR_TRACK_MS, self._poll_fake_cursor)
+
+    def _set_fake_cursor_active(
+        self, active: bool, x: int | None = None, y: int | None = None,
+    ) -> None:
         if active == self._fake_cursor_active:
             return
         self._fake_cursor_active = active
         self._real_cursor_visible_since = None
         if active:
-            self._fake_cursor.move_to(*self._last_mouse_pos)
+            # Prefer the position the caller already has this tick (from its
+            # own GetCursorInfo call) — falls back to a fresh query only if
+            # it wasn't passed in, never self._last_mouse_pos (see
+            # _poll_fake_cursor for why the hook-derived position isn't used
+            # for placing the fake cursor).
+            if x is None or y is None:
+                state = _get_cursor_state()
+                if state is not None:
+                    _real_showing, x, y = state
+            if x is not None and y is not None:
+                self._fake_cursor.move_to(x, y)
             self._fake_cursor.show()
         else:
             self._fake_cursor.hide()
@@ -2010,7 +2211,8 @@ class MapApp:
         if self._update_notified:
             return
         self._update_notified = True
-        if messagebox.askyesno(
+        if self._show_message(
+            "askyesno",
             "The-Maps",
             f"Đã có bản cập nhật mới trên GitHub ({latest_tag}). Mở trang tải về?",
         ):
@@ -2278,12 +2480,14 @@ def main() -> None:
         print(json.dumps(payload))
         return
 
+    _raise_timer_resolution()
     root = tk.Tk()
     try:
         MapApp(root)
     except RuntimeError as exc:
         messagebox.showerror("The-Maps", str(exc))
         root.destroy()
+        _restore_timer_resolution()
         return
     except Exception:
         crash_log = DATA_ROOT / "crash.log"
@@ -2298,10 +2502,10 @@ def main() -> None:
             f"Chi tiết lỗi đã được ghi vào:\n{crash_log}",
         )
         root.destroy()
+        _restore_timer_resolution()
         return
     root.mainloop()
 
 
 if __name__ == "__main__":
     main()
-
